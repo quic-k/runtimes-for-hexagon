@@ -1,0 +1,176 @@
+name: Build Hexagon LLVM Runtimes
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      LLVM_PROJECT_REF: main
+      SOURCE_ROOT: ${{ github.workspace }}/llvm-project
+      BUILD_DIR: ${{ github.workspace }}/build
+      INSTALL_DIR: ${{ github.workspace }}/install
+      HEXAGON_TOOLCHAIN_DIR: ${{ github.workspace }}/hexagon-toolchain
+      # Fixed source for Hexagon toolchain archive
+      HEXAGON_TOOLCHAIN_URL: https://github.com/picolibc/picolibc-ci-tools/releases/download/v11/clang-hexagon-toolchain.Linux-x86_64.tar.xz
+      HEXAGON_VERSION: v68
+      PICOLIBC_SRC: ${{ github.workspace }}/picolibc
+      PICOLIBC_BUILD: ${{ github.workspace }}/picolibc-build
+      PICOLIBC_SYSROOT: ${{ github.workspace }}/sysroot
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ninja-build cmake git python3 python3-pip \
+            curl ca-certificates tar xz-utils pkg-config \
+            clang libc++-dev libc++abi-dev libclang-rt-20-dev
+
+      - name: Install latest Meson
+        run: |
+          set -euo pipefail
+          python3 -m pip install --upgrade --user pip
+          python3 -m pip install --upgrade --user meson
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          meson --version
+
+      - name: Prepare directories
+        run: |
+          mkdir -p "$BUILD_DIR" "$INSTALL_DIR" "$HEXAGON_TOOLCHAIN_DIR"
+
+      - name: Fetch Hexagon toolchain
+        run: |
+          echo "Fetching Hexagon toolchain from $HEXAGON_TOOLCHAIN_URL"
+          curl -fsSL "$HEXAGON_TOOLCHAIN_URL" -o toolchain.tar.xz
+          mkdir -p "$HEXAGON_TOOLCHAIN_DIR"
+          tar -xJf toolchain.tar.xz -C "$HEXAGON_TOOLCHAIN_DIR" --strip-components=1
+
+      - name: Validate toolchain availability
+        run: |
+          set -euo pipefail
+          export PATH="$HEXAGON_TOOLCHAIN_DIR/bin:$PATH"
+          which clang || { echo 'clang not found in PATH'; exit 1; }
+          which clang++ || { echo 'clang++ not found in PATH'; exit 1; }
+          # Print toolchain clang version to mirror local build script behaviour
+          clang --version
+
+      - name: Clone Picolibc
+        run: |
+          git clone --depth 1 https://github.com/picolibc/picolibc.git "$PICOLIBC_SRC"
+
+      - name: Configure and build Picolibc (Hexagon v68)
+        run: |
+          set -euo pipefail
+          export PATH="$HEXAGON_TOOLCHAIN_DIR/bin:$PATH"
+          mkdir -p "$PICOLIBC_BUILD" "$PICOLIBC_SYSROOT"
+          CROSS_FILE="$PICOLIBC_BUILD/hexagon-cross.txt"
+          cat > "$CROSS_FILE" <<CROSS
+          [binaries]
+          c = ['clang', '-nostdlib']
+          c_ld = 'eld'
+          ar = 'llvm-ar'
+          strip = 'llvm-strip'
+          objcopy = 'llvm-objcopy'
+          objdump = 'llvm-objdump'
+          ranlib = 'llvm-ranlib'
+          pkgconfig = 'pkg-config'
+
+          [host_machine]
+          system = 'none'
+          cpu_family = 'hexagon'
+          cpu = 'hexagon'
+          endian = 'little'
+
+          [built-in options]
+          c_args = ['--target=hexagon-unknown-none-elf', '-G0', '-mv68', '-fuse-init-array', '-nostdlib']
+
+          [properties]
+          # hardcode runtime library, otherwise meson build configuration will add '-lgcc'
+          # use -Dc_link_args=-L$(clang -print-resource-dir)/lib/hexagon-unknown-none-elf flag while calling hexagon configure script
+          # so that clang can find builtins library
+          librt = '-lclang_rt.builtins'
+          skip_sanity_check = true
+          needs_exe_wrapper = true
+          link_spec = '--build-id=none'
+          default_ram_addr   = '0x00500000'
+          default_ram_size   = '0x00800000'
+          default_flash_addr   = '0x00100000'
+          default_flash_size   = '0x00400000'
+          CROSS
+          # Setup and build
+          meson setup "$PICOLIBC_BUILD" "$PICOLIBC_SRC" \
+            --cross-file "$CROSS_FILE" \
+            -Dposix-console=true \
+            -Dmultilib=false -Dtests=false \
+            --prefix="$PICOLIBC_SYSROOT" 
+          ninja -C "$PICOLIBC_BUILD" -v
+          ninja -C "$PICOLIBC_BUILD" install
+
+      - name: Clone llvm-project
+        run: |
+          git clone --depth 1 --branch "$LLVM_PROJECT_REF" https://github.com/llvm/llvm-project.git "$SOURCE_ROOT"
+
+      - name: Configure and build runtimes (Hexagon v68, using Picolibc sysroot)
+        run: |
+          set -euo pipefail
+          export PATH="$HEXAGON_TOOLCHAIN_DIR/bin:$PATH"
+          additional_flags="-G0 -m$HEXAGON_VERSION --sysroot=$PICOLIBC_SYSROOT"
+          conf_dir="$BUILD_DIR/build-runtimes-hexagon-$HEXAGON_VERSION"
+          # Install into the shared INSTALL_DIR so upload step can find it
+          install_prefix="$INSTALL_DIR/runtimes-hexagon-$HEXAGON_VERSION"
+          mkdir -p "$conf_dir" "$install_prefix"
+          cmake -G Ninja \
+            -DCMAKE_C_FLAGS="$additional_flags" \
+            -DCMAKE_CXX_FLAGS="-nostdlib++ -nostdinc++ $additional_flags" \
+            -S "$SOURCE_ROOT/runtimes" \
+            -B "$conf_dir" \
+            -DCMAKE_C_COMPILER="$(which clang)" \
+            -DCMAKE_CXX_COMPILER="$(which clang++)" \
+            -DCMAKE_C_COMPILER_TARGET=hexagon-unknown-none-elf \
+            -DCMAKE_CXX_COMPILER_TARGET=hexagon-unknown-none-elf \
+            -DCMAKE_SYSROOT="$PICOLIBC_SYSROOT" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$install_prefix" \
+            -DLLVM_ENABLE_RUNTIMES="libunwind;libcxxabi;libcxx" \
+            -DLIBCXX_CXX_ABI=libcxxabi \
+            -DCMAKE_CROSSCOMPILING=ON \
+            -DLIBUNWIND_ENABLE_SHARED=OFF \
+            -DLIBUNWIND_ENABLE_THREADS=OFF \
+            -DLIBUNWIND_USE_COMPILER_RT=ON \
+            -DLIBCXXABI_ENABLE_SHARED=OFF \
+            -DLIBCXXABI_ENABLE_THREADS=OFF \
+            -DLIBCXXABI_BAREMETAL=ON \
+            -DLIBUNWIND_IS_BAREMETAL=ON \
+            -DLIBCXXABI_USE_COMPILER_RT=ON \
+            -DLIBCXXABI_USE_LLVM_UNWINDER=ON \
+            -DLIBCXX_ENABLE_SHARED=OFF \
+            -DLIBCXX_ENABLE_THREADS=OFF \
+            -DLIBCXX_ENABLE_EXCEPTIONS=ON \
+            -DLIBCXX_ENABLE_FILESYSTEM=OFF \
+            -DLIBCXX_ENABLE_MONOTONIC_CLOCK=OFF \
+            -DLIBCXX_ENABLE_RANDOM_DEVICE=OFF \
+            -DLIBCXX_ENABLE_RTTI=ON \
+            -DLIBCXX_ENABLE_WIDE_CHARACTERS=OFF \
+            -DLIBCXX_ENABLE_LOCALIZATION=OFF \
+            -DLIBCXX_USE_COMPILER_RT=ON \
+            -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY
+
+          cmake --build "$conf_dir" -- install
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: hexagon-runtimes-$HEXAGON_VERSION
+          # Upload from INSTALL_DIR to avoid mismatch with build-specific paths
+          path: ${{ env.INSTALL_DIR }}/runtimes-hexagon-${{ env.HEXAGON_VERSION }}
+          if-no-files-found: error
