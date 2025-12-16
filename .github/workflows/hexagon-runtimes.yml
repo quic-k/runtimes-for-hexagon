@@ -95,9 +95,6 @@ jobs:
           c_args = ['--target=hexagon-unknown-none-elf', '-G0', '-mv68', '-fuse-init-array', '-nostdlib']
 
           [properties]
-          # hardcode runtime library, otherwise meson build configuration will add '-lgcc'
-          # use -Dc_link_args=-L$(clang -print-resource-dir)/lib/hexagon-unknown-none-elf flag while calling hexagon configure script
-          # so that clang can find builtins library
           librt = '-lclang_rt.builtins'
           skip_sanity_check = true
           needs_exe_wrapper = true
@@ -124,7 +121,7 @@ jobs:
         run: |
           set -euo pipefail
           export PATH="$HEXAGON_TOOLCHAIN_DIR/bin:$PATH"
-          additional_flags="-G0 -m$HEXAGON_VERSION --sysroot=$PICOLIBC_SYSROOT"
+          additional_flags="-G0 -m$HEXAGON_VERSION --sysroot=$PICOLIBC_SYSROOT -D_GNU_SOURCE='' -D_PICOLIBC_CTYPE_SMALL=0"
           conf_dir="$BUILD_DIR/build-runtimes-hexagon-$HEXAGON_VERSION"
           # Install into the shared INSTALL_DIR so upload step can find it
           install_prefix="$INSTALL_DIR/runtimes-hexagon-$HEXAGON_VERSION"
@@ -160,9 +157,10 @@ jobs:
             -DLIBCXX_ENABLE_MONOTONIC_CLOCK=OFF \
             -DLIBCXX_ENABLE_RANDOM_DEVICE=OFF \
             -DLIBCXX_ENABLE_RTTI=ON \
-            -DLIBCXX_ENABLE_WIDE_CHARACTERS=OFF \
-            -DLIBCXX_ENABLE_LOCALIZATION=OFF \
+            -DLIBCXX_ENABLE_WIDE_CHARACTERS=ON \
+            -DLIBCXX_ENABLE_LOCALIZATION=ON \
             -DLIBCXX_USE_COMPILER_RT=ON \
+            -DRUNTIMES_USE_LIBC=picolibc \
             -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY
 
           cmake --build "$conf_dir" -- install
